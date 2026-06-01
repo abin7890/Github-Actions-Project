@@ -171,18 +171,65 @@ jobs:
         with:
           version: latest
 
-      - name: Configure kubeconfig
+      - name: Get EKS cluster name
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.EKS_KUBECONFIG }}" > $HOME/.kube/config
+          # Use cluster name from secret
+          if [ -n "${{ secrets.EKS_CLUSTER_NAME }}" ]; then
+            echo "CLUSTER_NAME=${{ secrets.EKS_CLUSTER_NAME }}" >> $GITHUB_ENV
+          else
+            # Auto-discover cluster if only one exists
+            CLUSTER=$(aws eks list-clusters --region ap-south-1 --query 'clusters[0]' --output text)
+            if [ "$CLUSTER" != "None" ] && [ -n "$CLUSTER" ]; then
+              echo "CLUSTER_NAME=$CLUSTER" >> $GITHUB_ENV
+              echo "Auto-discovered cluster: $CLUSTER"
+            else
+              echo "ERROR: No EKS cluster found. Please set EKS_CLUSTER_NAME secret."
+              exit 1
+            fi
+          fi
 
-      - name: Verify kubectl connection
+      - name: Configure kubeconfig dynamically
         run: |
-          kubectl get nodes
+          echo "Configuring kubeconfig for cluster: $CLUSTER_NAME"
+          aws eks update-kubeconfig --region ap-south-1 --name $CLUSTER_NAME
+          
+          # Verify configuration
+          echo "Verifying kubectl connection..."
           kubectl cluster-info
+          kubectl get nodes
+
+      - name: Verify deployment permissions
+        run: |
+          echo "Checking RBAC permissions..."
+          kubectl auth can-i get pods
+          kubectl auth can-i create deployments
+          kubectl auth can-i get services
+
+      - name: Debug kubeconfig (if connection fails)
+        if: failure()
+        run: |
+          echo "=== Kubeconfig file info ==="
+          ls -la $HOME/.kube/config
+          echo "=== Current context ==="
+          kubectl config current-context 2>&1 || echo "Failed to get context"
+          echo "=== List all contexts ==="
+          kubectl config get-contexts 2>&1 || echo "Failed to list contexts"
 
       - name: Deploy to EKS
         run: |
+          # Validate manifest exists
+          if [ ! -f "ds.yml" ]; then
+            echo "ERROR: ds.yml not found!"
+            echo "Available files:"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Applying deployment manifest..."
           kubectl apply -f ds.yml
-          kubectl get pods
-          kubectl get svc
+          
+          echo "Deployment status:"
+          kubectl get all
+          
+          echo "Recent events:"
+          kubectl get events --sort-by='.lastTimestamp' | tail -10
